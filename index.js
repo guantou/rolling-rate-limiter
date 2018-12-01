@@ -4,9 +4,9 @@ var uuid = require("uuid/v4");
 
 function RateLimiter (options) {
   var redis           = options.redis,
-    interval        = options.interval * 1000, // in microseconds
-    maxInInterval   = options.maxInInterval,
-    minDifference   = options.minDifference ? 1000 * options.minDifference : null, // also in microseconds
+    interval        = options.interval * 1000, // 时间窗口刻度
+    maxInInterval   = options.maxInInterval, // 限流阈值
+    minDifference   = options.minDifference ? 1000 * options.minDifference : null, // 请求频率间隔
     namespace       = options.namespace || (options.redis && (`rate-limiter-${ Math.random().toString(36).slice(2)}`)) || null;
 
   assert(interval > 0, "Must pass a positive integer for `options.interval`");
@@ -47,30 +47,40 @@ function RateLimiter (options) {
       var key = namespace + id;
       var clearBefore = now - interval;
 
+      // 开启redis的批量提交
       var batch = redis.multi();
+      // 将redis有序集合中，时间窗口之间的数据移除
       batch.zremrangebyscore(key, 0, clearBefore);
+      // 取出所有的数据（当前时间段的数据）
       batch.zrange(key, 0, -1, "withscores");
+      // 将本次请求存入有序集合
       batch.zadd(key, now, uuid());
+      // 延长过期时间
       batch.expire(key, Math.ceil(interval / 1000000)); // convert to seconds, as used by redis ttl.
       batch.exec(function(err, resultArr) {
         if (err) return cb(err);
 
+        // 时间窗口内的请求记录
         var zrangeResult = resultArr[1];
         // If the second element of the ZRANGE result is an array, then use it as the result. This is how ioredis formats the result ([err, [result]])
         if (Array.isArray(zrangeResult[1])) {
           zrangeResult = zrangeResult[1];
         }
         
+        //只提取记录中的时间戳，组合成数组。
         var userSet = zrangeToUserSet(zrangeResult).filter(function(elem, i) {
           return i % 2 != 0;
         });
 
+        // 判断记录长度（时间窗口内请求次数）是否超出阈值
         var tooManyInInterval = userSet.length >= maxInInterval;
+        // 本次请求距离上次的间隔
         var timeSinceLastRequest = now - userSet[userSet.length - 1];
 
         var result;
+        //剩余次数
         var remaining = maxInInterval - userSet.length - 1;
-
+        //超出阈值，或请求间隔低于预期，返回错误
         if (tooManyInInterval || timeSinceLastRequest < minDifference) {
           result = Math.max(tooManyInInterval ? userSet[userSet.length - maxInInterval] - now + interval : 0, minDifference ? minDifference : 0);
           result = Math.floor(result / 1000); // convert to miliseconds for user readability.
